@@ -13,7 +13,8 @@ Configuration dans un fichier .env (voir .env.example) :
 Usage :
     python sttaas_stereo.py appel.wav --out sortie/ [--env chemin/.env]
 
-Dépendances : ffmpeg/ffprobe dans le PATH, `pip install requests`.
+Dépendances (aucun binaire externe, pas de ffmpeg) :
+    pip install requests soundfile soxr numpy
 """
 import argparse
 import array
@@ -22,7 +23,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import sys
 import time
 import unicodedata
@@ -73,23 +73,48 @@ def load_env(path: Path) -> dict:
 
 
 # ----------------------------------------------------------------- audio
+TARGET_SR = 16000
+
+
+def _audio_libs():
+    try:
+        import numpy as np
+        import soundfile as sf
+        import soxr
+    except ImportError as e:
+        sys.exit(f"Dépendance manquante ({e.name}) : pip install soundfile soxr numpy")
+    return np, sf, soxr
+
+
 def duration_s(path: Path) -> float:
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=nw=1:nk=1", str(path)],
-        check=True, capture_output=True, text=True).stdout
-    return float(out.strip())
+    _, sf, _ = _audio_libs()
+    return sf.info(str(path)).duration
 
 
 def split_channels(src: Path, workdir: Path) -> dict:
-    """Stéréo -> 2 fichiers mono 16 kHz PCM 16 bits. Aucun débruitage."""
+    """Stéréo -> 2 fichiers mono 16 kHz PCM 16 bits. Aucun débruitage.
+    Lecture par libsndfile (WAV PCM / A-law / µ-law, FLAC, OGG, MP3), sans ffmpeg ;
+    rééchantillonnage par soxr en qualité maximale (VHQ)."""
+    np, sf, soxr = _audio_libs()
+    try:
+        data, sr = sf.read(str(src), dtype="float32", always_2d=True)
+    except sf.LibsndfileError as e:
+        raise RuntimeError(f"Lecture audio impossible ({src}) : {e}") from None
+    if data.shape[1] != 2:
+        raise RuntimeError(
+            f"{src.name} : {data.shape[1]} canal/canaux, 2 attendus "
+            f"(gauche = client, droit = conseiller)")
     workdir.mkdir(parents=True, exist_ok=True)
-    outs = {ch: workdir / f"{src.stem}__{ROLES[ch]}.wav" for ch in "LR"}
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-filter_complex",
-           "[0:a]channelsplit=channel_layout=stereo[L][R]"]
-    for ch in "LR":
-        cmd += ["-map", f"[{ch}]", "-ar", "16000", "-c:a", "pcm_s16le", str(outs[ch])]
-    subprocess.run(cmd, check=True)
+    outs = {}
+    for i, ch in enumerate("LR"):
+        x = data[:, i]
+        if sr != TARGET_SR:
+            x = soxr.resample(x, sr, TARGET_SR, quality="VHQ")
+        # libsndfile n'écrête pas par défaut : sans ceci, un dépassement du filtre
+        # de rééchantillonnage se replierait en un claquement audible
+        x = np.clip(x, -1.0, 32767 / 32768)
+        outs[ch] = workdir / f"{src.stem}__{ROLES[ch]}.wav"
+        sf.write(str(outs[ch]), x, TARGET_SR, subtype="PCM_16")
     return outs
 
 
