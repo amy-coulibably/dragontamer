@@ -11,10 +11,23 @@ Configuration dans un fichier .env (voir .env.example) :
     STTAAS_CA_BUNDLE=/chemin/vers/ca-bundle.pem   # CA d'entreprise (PEM)
 
 Usage :
-    python sttaas_stereo.py appel.wav --out sortie/ [--env chemin/.env]
+    python sttaas_stereo.py appel.mp3 --out sortie/     # un appel
+    python sttaas_stereo.py audios/   --out sortie/     # tous les appels d'un dossier
+
+En fin de run, un rapport HTML est toujours généré (rapport.html pour un dossier,
+<nom>.rapport.html pour un appel seul) : transcription cliquable pour écouter chaque
+segment, et analyse WER/CER pour les appels dont l'annotation <nom>.json se trouve à
+côté de l'audio. Sans annotation, l'appel figure dans le rapport sans évaluation.
+
+Sorties par appel, dans --out :
+    <nom>.transcription.json   {"id", "audio", "transcription", "diarization": [
+                                 {"start", "end", "speaker": "Client"|"Conseiller", "text"}]}
+    <nom>.txt                  dialogue lisible
+    <nom>.detail.json          mots horodatés, paramètres, passages filtrés
+    raw/                       réponses brutes du service (non récupérables deux fois)
 
 Dépendances (aucun binaire externe, pas de ffmpeg) :
-    pip install requests soundfile soxr numpy
+    pip install requests soundfile soxr numpy rapidfuzz num2words
 """
 import argparse
 import array
@@ -30,6 +43,8 @@ import wave
 from pathlib import Path
 
 ROLES = {"L": "client", "R": "conseiller"}
+LABELS = {"client": "Client", "conseiller": "Conseiller"}
+AUDIO_EXT = {".mp3", ".wav", ".flac", ".ogg"}
 
 # Hallucinations Whisper typiques sur silence (français). À enrichir avec vos constats.
 HALLU = re.compile(
@@ -180,6 +195,7 @@ class Sttaas:
     def result(self, job_id, raw_path: Path):
         """Le résultat n'est récupérable qu'UNE fois : écrit sur disque avant tout."""
         data = self._post("result", {"job_id": job_id}, tries=1)
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
         raw_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         return data
 
@@ -305,11 +321,66 @@ def fmt(t: float) -> str:
     return f"{int(t // 60):02d}:{t % 60:05.2f}"
 
 
+def clean_text(t: str) -> str:
+    """Recolle les apostrophes détachées par l'alignement ("j 'ai" -> "j'ai")."""
+    t = re.sub(r"\s+(['’])\s*(?=\w)", r"\1", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def to_export(audio: Path, turns: list) -> dict:
+    """Format de livraison : id / audio / transcription / diarization."""
+    diar = [{"start": round(t["start"], 3), "end": round(t["end"], 3),
+             "speaker": LABELS[t["speaker"]], "text": clean_text(t["text"])}
+            for t in turns]
+    return {"id": audio.stem, "audio": audio.name,
+            "transcription": " ".join(d["text"] for d in diar),
+            "diarization": diar}
+
+
+def transcribe_file(audio: Path, out: Path, api, params: dict, swap=False) -> Path:
+    """Transcrit un appel stéréo et écrit <stem>.transcription.json (+ .txt, .detail.json)."""
+    wavs_ch = split_channels(audio, out / "wav")
+    roles = {"L": "conseiller", "R": "client"} if swap else ROLES
+    wavs = {roles[ch]: p for ch, p in wavs_ch.items()}
+    files = list(wavs.values())
+    # Doc : au-delà d'1 h, un seul fichier par requête.
+    groups = [[f] for f in files] if duration_s(files[0]) > 3600 else [files]
+
+    by_file = {}
+    for n, grp in enumerate(groups):
+        job = api.submit(grp, params)
+        print(f"  job {job} soumis ({len(grp)} fichier(s))", file=sys.stderr)
+        status = api.wait(job)
+        data = api.result(job, out / "raw" / f"{audio.stem}__{n}_{job}.json")
+        for r in data.get("results", []):
+            if "error" in r or status == "failed":
+                raise RuntimeError(f"{r.get('filename')}: {r.get('error', status)}")
+            by_file[r["filename"]] = r
+    missing = [p.name for p in files if p.name not in by_file]
+    if missing:
+        raise RuntimeError(f"résultat absent pour {', '.join(missing)}")
+
+    turns, log = build_dialogue({role: by_file[p.name] for role, p in wavs.items()}, wavs)
+    stem = out / audio.stem
+    dump = lambda o: json.dumps(o, ensure_ascii=False, indent=2)
+    final = Path(f"{stem}.transcription.json")
+    final.write_text(dump(to_export(audio, turns)), encoding="utf-8")
+    Path(f"{stem}.detail.json").write_text(dump(
+        {"audio": audio.name, "params": params, "turns": turns, "filtres": log}),
+        encoding="utf-8")
+    Path(f"{stem}.txt").write_text("\n".join(
+        f"[{fmt(t['start'])}] {LABELS[t['speaker']].upper()} : {clean_text(t['text'])}"
+        for t in turns) + "\n", encoding="utf-8")
+    print(f"  {len(turns)} tours, {len(log)} passage(s) filtré(s) -> {final.name}",
+          file=sys.stderr)
+    return final
+
+
 # ------------------------------------------------------------------ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("audio", type=Path)
+    ap.add_argument("audio", type=Path, help="un fichier audio, ou un dossier d'audios")
     ap.add_argument("--out", type=Path, default=Path("out"))
     ap.add_argument("--env", type=Path, default=Path(".env"),
                     help="fichier .env (défaut : ./.env)")
@@ -320,13 +391,26 @@ def main():
                     help="envoyé seulement si précisé (ex. 0.1) : absent d'une des deux docs")
     ap.add_argument("--no-hotwords", action="store_true")
     ap.add_argument("--swap", action="store_true", help="si gauche = conseiller")
+    ap.add_argument("--force", action="store_true",
+                    help="retranscrit même si la sortie existe déjà")
+    ap.add_argument("--no-report", action="store_true",
+                    help="ne génère pas le rapport HTML en fin de run")
+    ap.add_argument("--embed-audio", action="store_true",
+                    help="intègre l'audio dans le rapport HTML (fichier autonome, mais "
+                         "qui contient alors les enregistrements)")
     a = ap.parse_args()
+    if not a.no_report:
+        import sttaas_eval                    # avant le run : une dépendance manquante
+                                              # doit échouer tout de suite, pas à la fin
 
     cfg = load_env(a.env)                     # avant tout traitement audio
-    a.out.mkdir(parents=True, exist_ok=True)
-    wavs_ch = split_channels(a.audio, a.out / "wav")
-    roles = {"L": "conseiller", "R": "client"} if a.swap else ROLES
-    wavs = {roles[ch]: p for ch, p in wavs_ch.items()}
+    if a.audio.is_dir():
+        audios = sorted(p for p in a.audio.iterdir() if p.suffix.lower() in AUDIO_EXT)
+        if not audios:
+            sys.exit(f"Aucun audio ({', '.join(sorted(AUDIO_EXT))}) dans {a.audio}")
+    else:
+        audios = [a.audio]
+    (a.out / "raw").mkdir(parents=True, exist_ok=True)
 
     params = {"language": "fr", "detect_language": False,
               "enable_diarization": False,
@@ -334,35 +418,33 @@ def main():
               "vad_onset": a.vad_onset}
     if a.min_duration_on is not None:
         params["min_duration_on"] = a.min_duration_on
-
     api = Sttaas(cfg["STTAAS_URL"], cfg["STTAAS_API_KEY"],
                  cfg["STTAAS_CA_BUNDLE"], a.prefix)
-    files = list(wavs.values())
-    # Doc : au-delà d'1 h, un seul fichier par requête.
-    groups = [[f] for f in files] if duration_s(files[0]) > 3600 else [files]
 
-    by_file = {}
-    for n, grp in enumerate(groups):
-        job = api.submit(grp, params)
-        print(f"job {job} soumis ({len(grp)} fichier(s))", file=sys.stderr)
-        status = api.wait(job)
-        data = api.result(job, a.out / f"{a.audio.stem}__raw_{n}_{job}.json")
-        for r in data.get("results", []):
-            if "error" in r or status == "failed":
-                raise RuntimeError(f"{r.get('filename')}: {r.get('error', status)}")
-            by_file[r["filename"]] = r
+    failed = []
+    for n, audio in enumerate(audios, 1):
+        print(f"[{n}/{len(audios)}] {audio.name}", file=sys.stderr)
+        if (a.out / f"{audio.stem}.transcription.json").exists() and not a.force:
+            print("  déjà transcrit (--force pour refaire)", file=sys.stderr)
+            continue
+        try:
+            transcribe_file(audio, a.out, api, params, a.swap)
+        except (RuntimeError, TimeoutError) as e:
+            if len(audios) == 1:
+                raise
+            failed.append(audio.name)
+            print(f"  ÉCHEC : {e}", file=sys.stderr)
+    if failed:
+        print(f"{len(failed)} échec(s) : {', '.join(failed)}", file=sys.stderr)
 
-    res_by_role = {role: by_file[p.name] for role, p in wavs.items()}
-    turns, log = build_dialogue(res_by_role, wavs)
-
-    stem = a.out / a.audio.stem
-    Path(f"{stem}.json").write_text(json.dumps(
-        {"audio": a.audio.name, "params": params, "turns": turns, "filtres": log},
-        ensure_ascii=False, indent=2), encoding="utf-8")
-    Path(f"{stem}.txt").write_text("\n".join(
-        f"[{fmt(t['start'])}] {t['speaker'].upper()} : {t['text']}" for t in turns) + "\n",
-        encoding="utf-8")
-    print(f"{len(turns)} tours, {len(log)} segment(s) filtré(s) -> {stem}.txt / .json")
+    if not a.no_report:
+        single = not a.audio.is_dir()
+        sttaas_eval.run(a.audio.parent if single else a.audio, a.out, a.out,
+                        embed_audio=a.embed_audio,
+                        only=[a.audio.name] if single else None,
+                        prefix=f"{a.audio.stem}." if single else "")
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
